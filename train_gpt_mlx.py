@@ -63,11 +63,12 @@ class Hyperparameters:
     warmdown_iters: int = int(os.environ.get("WARMDOWN_ITERS", 1200))
     max_wallclock_seconds: float = float(os.environ.get("MAX_WALLCLOCK_SECONDS", 600.0))
 
-    # Model (defaults match the current baseline setup).
+    # Model – depth recurrence: num_unique_layers blocks repeated to fill num_layers effective depth.
     vocab_size: int = int(os.environ.get("VOCAB_SIZE", 1024))
-    num_layers: int = int(os.environ.get("NUM_LAYERS", 9))
-    model_dim: int = int(os.environ.get("MODEL_DIM", 512))
-    num_heads: int = int(os.environ.get("NUM_HEADS", 8))
+    num_layers: int = int(os.environ.get("NUM_LAYERS", 15))  # effective depth
+    num_unique_layers: int = int(os.environ.get("NUM_UNIQUE_LAYERS", 3))
+    model_dim: int = int(os.environ.get("MODEL_DIM", 768))
+    num_heads: int = int(os.environ.get("NUM_HEADS", 12))
     num_kv_heads: int = int(os.environ.get("NUM_KV_HEADS", 4))
     mlp_mult: int = int(os.environ.get("MLP_MULT", 2))
     tie_embeddings: bool = bool(int(os.environ.get("TIE_EMBEDDINGS", "1")))
@@ -120,7 +121,7 @@ CONTROL_TENSOR_NAME_PATTERNS = tuple(
     pattern
     for pattern in os.environ.get(
         "CONTROL_TENSOR_NAME_PATTERNS",
-        "attn_scale,attn_scales,mlp_scale,mlp_scales,resid_mix,resid_mixes,q_gain,skip_weight,skip_weights",
+        "attn_scale,attn_scales,mlp_scale,mlp_scales,resid_mix,resid_mixes,q_gain,skip_weight,skip_weights,eff_attn_scales,eff_mlp_scales,eff_resid_mixes",
     ).split(",")
     if pattern
 )
@@ -348,6 +349,8 @@ class MLP(nn.Module):
 
 
 class Block(nn.Module):
+    # Shared block: heavy parameters (attention projections + MLP) are shared across repetitions.
+    # Per-repetition scales (attn_scale, mlp_scale, resid_mix) are passed in from the GPT model.
     def __init__(
         self,
         dim: int,
@@ -362,42 +365,53 @@ class Block(nn.Module):
         self.mlp_norm = RMSNormNoWeight()
         self.attn = CausalSelfAttention(dim, num_heads, num_kv_heads, rope_base, qk_gain_init)
         self.mlp = MLP(dim, mlp_mult)
-        self.attn_scale = mx.ones((dim,), dtype=mx.float32)
-        self.mlp_scale = mx.ones((dim,), dtype=mx.float32)
-        self.resid_mix = mx.array(np.stack((np.ones((dim,), dtype=np.float32), np.zeros((dim,), dtype=np.float32))))
 
-    def __call__(self, x: mx.array, x0: mx.array) -> mx.array:
-        mix = self.resid_mix.astype(x.dtype)
+    def __call__(self, x: mx.array, x0: mx.array,
+                 attn_scale: mx.array, mlp_scale: mx.array, resid_mix: mx.array) -> mx.array:
+        mix = resid_mix.astype(x.dtype)
         x = mix[0][None, None, :] * x + mix[1][None, None, :] * x0
         attn_out = self.attn(self.attn_norm(x))
-        x = x + self.attn_scale.astype(x.dtype)[None, None, :] * attn_out
-        x = x + self.mlp_scale.astype(x.dtype)[None, None, :] * self.mlp(self.mlp_norm(x))
+        x = x + attn_scale.astype(x.dtype)[None, None, :] * attn_out
+        x = x + mlp_scale.astype(x.dtype)[None, None, :] * self.mlp(self.mlp_norm(x))
         return x
 
 
 class GPT(nn.Module):
-    # - token embedding + RMSNorm
-    # - encoder half accumulates skip tensors
-    # - decoder half consumes reversed skips with learned skip_weights
-    # - tied embeddings for the LM head (the baseline default setup)
-    def __init__(self, vocab_size: int, num_layers: int, dim: int, num_heads: int, num_kv_heads: int, mlp_mult: int,
-                 logit_chunk_tokens: int, logit_softcap: float, rope_base: float, tied_embed_init_std: float,
-                 qk_gain_init: float):
+    # Depth-recurrent GPT: num_unique_layers shared blocks repeated to fill num_layers effective depth.
+    # Per-effective-layer adaptive scales allow each repetition to specialize.
+    # U-Net skip connections operate on the effective layer indices.
+    def __init__(self, vocab_size: int, num_layers: int, num_unique_layers: int, dim: int,
+                 num_heads: int, num_kv_heads: int, mlp_mult: int,
+                 logit_chunk_tokens: int, logit_softcap: float, rope_base: float,
+                 tied_embed_init_std: float, qk_gain_init: float):
         super().__init__()
         if logit_softcap <= 0.0:
             raise ValueError(f"logit_softcap must be positive, got {logit_softcap}")
         self.logit_chunk_tokens = logit_chunk_tokens
         self.logit_softcap = logit_softcap
+        self.num_unique_layers = num_unique_layers
 
         self.tok_emb = nn.Embedding(vocab_size, dim)
-        self.num_encoder_layers = num_layers // 2
-        self.num_decoder_layers = num_layers - self.num_encoder_layers
+        n_eff = num_layers  # effective depth
+        self.num_encoder_layers = n_eff // 2
+        self.num_decoder_layers = n_eff - self.num_encoder_layers
         self.num_skip_weights = min(self.num_encoder_layers, self.num_decoder_layers)
         self.skip_weights = mx.ones((self.num_skip_weights, dim), dtype=mx.float32)
+
+        # Shared blocks (only num_unique_layers, repeated cyclically)
         self.blocks = [
             Block(dim, num_heads, num_kv_heads, mlp_mult, rope_base, qk_gain_init)
-            for i in range(num_layers)
+            for _ in range(num_unique_layers)
         ]
+
+        # Per-effective-layer adaptive parameters (cheap: ~4*dim per layer)
+        self.eff_attn_scales = [mx.ones((dim,), dtype=mx.float32) for _ in range(n_eff)]
+        self.eff_mlp_scales = [mx.ones((dim,), dtype=mx.float32) for _ in range(n_eff)]
+        self.eff_resid_mixes = [
+            mx.array(np.stack((np.ones((dim,), dtype=np.float32), np.zeros((dim,), dtype=np.float32))))
+            for _ in range(n_eff)
+        ]
+
         self.final_norm = RMSNormNoWeight()
 
         for b in self.blocks:
@@ -416,16 +430,16 @@ class GPT(nn.Module):
         x0 = x
         skips: list[mx.array] = []
 
-        for i in range(self.num_encoder_layers):
-            x = self.blocks[i](x, x0)
+        for eff_i in range(self.num_encoder_layers):
+            block = self.blocks[eff_i % self.num_unique_layers]
+            x = block(x, x0, self.eff_attn_scales[eff_i], self.eff_mlp_scales[eff_i], self.eff_resid_mixes[eff_i])
             skips.append(x)
         for i in range(self.num_decoder_layers):
-            # Odd layer counts have one more decoder block than encoder block. The baseline only
-            # applies a skip connection when one exists, then runs the remaining decoder block(s)
-            # without an added skip.
+            eff_i = self.num_encoder_layers + i
             if skips:
                 x = x + self.skip_weights[i].astype(x.dtype)[None, None, :] * skips.pop()
-            x = self.blocks[self.num_encoder_layers + i](x, x0)
+            block = self.blocks[eff_i % self.num_unique_layers]
+            x = block(x, x0, self.eff_attn_scales[eff_i], self.eff_mlp_scales[eff_i], self.eff_resid_mixes[eff_i])
         return self.final_norm(x)
 
     def loss(self, input_ids: mx.array, target_ids: mx.array) -> mx.array:
@@ -495,7 +509,11 @@ class SplitOptimizers:
         self.scalar_keys = [
             k
             for k, p in params.items()
-            if k == "skip_weights" or (k.startswith("blocks.") and (p.ndim < 2 or any(pattern in k for pattern in CONTROL_TENSOR_NAME_PATTERNS)))
+            if k == "skip_weights"
+            or k.startswith("eff_attn_scales.")
+            or k.startswith("eff_mlp_scales.")
+            or k.startswith("eff_resid_mixes.")
+            or (k.startswith("blocks.") and (p.ndim < 2 or any(pattern in k for pattern in CONTROL_TENSOR_NAME_PATTERNS)))
         ]
 
         self.muon = Muon(self.matrix_keys, params, args)
@@ -876,6 +894,7 @@ def main() -> None:
     model = GPT(
         vocab_size=args.vocab_size,
         num_layers=args.num_layers,
+        num_unique_layers=args.num_unique_layers,
         dim=args.model_dim,
         num_heads=args.num_heads,
         num_kv_heads=args.num_kv_heads,
@@ -920,7 +939,8 @@ def main() -> None:
         log(f"train_loader:dataset:{dataset_name} train_shards:{actual_train_files}/{expected_train_files}")
     log(f"tokenizer_path:{args.tokenizer_path}")
     log(
-        f"model_params:{n_params} vocab_size:{args.vocab_size} layers:{args.num_layers} "
+        f"model_params:{n_params} vocab_size:{args.vocab_size} "
+        f"unique_layers:{args.num_unique_layers} effective_layers:{args.num_layers} "
         f"dim:{args.model_dim} heads:{args.num_heads} kv_heads:{args.num_kv_heads} "
         f"seq_len:{args.train_seq_len} tie_embeddings:{args.tie_embeddings}"
     )
